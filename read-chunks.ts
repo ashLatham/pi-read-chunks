@@ -38,6 +38,9 @@
 
 import { existsSync, readFileSync, statSync, writeFileSync, appendFileSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
+import * as os from "node:os";
+import { pathToFileURL } from "node:url";
+import { Text, hyperlink, getCapabilities } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -406,7 +409,7 @@ export default function (pi: ExtensionAPI) {
 		name: "read-chunks",
 		label: "read-chunks (chunked scan)",
 		description:
-			"TEXT-ONLY. Use instead of the built-in read() for text files. Binary files (PDF, archives, images, etc.) are not supported — use read() or another specialised tool for those. Two modes: (1) Scan a text file by splitting it into overlapping chunks snapped to natural boundaries (function endings for code, paragraph breaks for prose) and summarising each chunk, chaining the running summary forward. ALWAYS pass a precise query describing exactly what you are looking for; scanning stops early once a chunk answers it. (2) Line-range read: append `:START-END` (inclusive 1-indexed line span, e.g. `file.txt:2000-2089`) to return those lines verbatim; or append `:N` to start at line N and read to EOF. Both bypass all summarisation. This ignores the query.",
+			"TEXT-ONLY. Use instead of the built-in read() for text files.",
 		parameters: ReadParams,
 
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -613,6 +616,17 @@ export default function (pi: ExtensionAPI) {
 			};
 		},
 
+		// Mirror the built-in read() call header so the UI shows
+		// `read-chunks <path>:<line-start-line-end>` (+ optional `[query: ...]`)
+		// instead of just the bare tool name. Built-in tools render their header via
+		// a custom renderCall; custom tools fall back to the plain tool-name fallback,
+		// so we supply one here.
+		renderCall(args, theme, context) {
+			const text = context.lastComponent ?? new Text("", 0, 0);
+			text.setText(formatReadChunksCall(args, theme, context.cwd));
+			return text;
+		},
+
 		// Full-file results keep built-in read presentation behavior. Chunked results
 		// are emitted as JSON because the model needs structured diagnostic metadata.
 	});
@@ -620,17 +634,56 @@ export default function (pi: ExtensionAPI) {
 	// Calls to the built-in read() are routed as follows:
 	//   - Image files (png/jpg/gif/...) → pass through; read() returns image content.
 	//   - Other binary files (pdf/zip/docx/...) → pass through; read() delivers bytes.
-	//   - Text files (and unknown extensions) → block, route model to read-chunks.
+	//   - Targeted line-range reads (offset and/or limit set) → pass through;
+	//     native read() serves them. These are scoped, summarisation-free.
+	//   - Line-range suffixes (:N or :START-END) on `path` → strip suffix,
+	//     translate to native read()'s offset/limit by mutating event.input,
+	//     and let native read() execute. Native read() does not understand the
+	//     suffix form, so the rewrite is required.
+	//   - Text files (and unknown extensions) without a range → block, route
+	//     model to read-chunks.
 	// The returned reason is surfaced to the model for its continuation; omitting
 	// terminate keeps the turn alive so the model reroutes to read-chunks.
 	pi.on("tool_call", (event) => {
 		if (event.toolName !== "read") return;
-		const input = event.input as { path?: unknown } | undefined;
+		const input = event.input as { path?: unknown; offset?: number; limit?: number } | undefined;
 		const path = typeof input?.path === "string" ? input.path : "";
 		if (path && (isImagePath(path) || isBinaryPath(path))) return;
+
+		// Targeted line-range read: native read() handles it cheaply and the model
+		// already uses this form (offset/limit) because the read tool's schema
+		// documents it. Bypass the block — these are scoped, summarisation-free
+		// reads, exactly the kind we want read() to serve directly.
+		const hasExplicitRange = typeof input?.offset === "number" || typeof input?.limit === "number";
+		if (hasExplicitRange) return;
+
+		// Numeric line-range suffix (:N or :START-END): strip it from `path` and
+		// translate to native read()'s offset/limit, mutating event.input in place.
+		// Per the extension API contract, in-place mutation patches the args that
+		// the tool will execute with — no re-validation occurs after.
+		//
+		// Requires at least one char before the `:digits` (`.+`, not `.*?`) so
+		// that bare `:50` is rejected (a path cannot be `:50`) and so the engine
+		// picks the *last* colon-separator when the path itself contains colons
+		// (e.g. Windows `C:\Users\x\file.txt:10` or any URL-like prefix).
+		const m = path.match(/^(.+):(\d+)(?:-(\d+))?$/);
+		if (m) {
+			const newPath = m[1];
+			const startLine = Number(m[2]);
+			const endLine = m[3] !== undefined ? Number(m[3]) : undefined;
+			input!.path = newPath;
+			input!.offset = startLine;
+			if (endLine !== undefined) {
+				input!.limit = Math.max(1, endLine - startLine + 1);
+			} else {
+				delete input!.limit;
+			}
+			return;
+		}
+
 		return {
 			block: true,
-			reason: "Built-in read() is disabled for text files. Use read-chunks(path, query) with a concise query describing what you are looking for. For a line range, append `:START-END` to the path (e.g. file.txt:2000-2089), which returns those lines verbatim with no summarisation. read-chunks is TEXT-ONLY: for binary files (PDF, archives, images, office docs, etc.) continue to use read().",
+			reason: "Built-in read() is disabled for text files. Use read-chunks(path/file, query) with a concise query describing what you are looking for.",
 		};
 	});
 
@@ -661,6 +714,49 @@ export default function (pi: ExtensionAPI) {
 			details: event.details,
 		};
 	});
+}
+
+// ---------- Call-header formatting ----------
+
+/** Shorten a path by replacing the home dir prefix with ~ (matches pi's built-in read header). */
+function shortenPath(p: string): string {
+	const home = os.homedir();
+	return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+}
+
+/** Render a path accent-colored and hyperlinked when the terminal supports it. Mirrors pi's renderToolPath(). */
+function renderToolPath(rawPath: string | null, theme: any, cwd: string): string {
+	if (rawPath === null) return theme.fg("error", "[invalid arg]");
+	const value = rawPath || "";
+	if (!value) return theme.fg("toolOutput", "...");
+	const styled = theme.fg("accent", shortenPath(value));
+	if (!getCapabilities().hyperlinks) return styled;
+	return hyperlink(styled, pathToFileURL(resolve(cwd, value)).href);
+}
+
+/**
+ * Build the read-chunks call header: `read-chunks <path>:<range>` plus an optional
+ * `[query: ...]` suffix. Derives the line-range from the same `:N` / `:START-END`
+ * shorthand execute() parses, so the header matches what was actually requested.
+ */
+function formatReadChunksCall(args: any, theme: any, cwd: string): string {
+	const rawPath = typeof args?.path === "string" ? args.path : "";
+
+	let pathPart = rawPath;
+	let rangeSuffix = "";
+	const m = rawPath.match(/^(.*?):(\d+)(?:-(\d+))?$/);
+	if (m && m.index !== undefined) {
+		rangeSuffix = `:${m[2]}${m[3] !== undefined ? `-${m[3]}` : ""}`;
+		pathPart = m[1];
+	}
+
+	const pathDisplay = renderToolPath(pathPart || null, theme, cwd);
+	let text = `${theme.fg("toolTitle", theme.bold("read-chunks"))} ${pathDisplay}${theme.fg("warning", rangeSuffix)}`;
+
+	if (typeof args?.query === "string" && args.query.trim()) {
+		text += theme.fg("muted", ` [query: ${args.query.trim()}]`);
+	}
+	return text;
 }
 
 // ---------- Summary builder ----------

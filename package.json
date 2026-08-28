@@ -1,7 +1,7 @@
 {
   "name": "pi-read-chunks",
-  "version": "1.0.0",
-  "description": "Pi extension that replaces the built-in read() for text files with a chunked, summarising reader. Large files are split at natural boundaries, each chunk is summarised by the active model, and a query stops the scan early at the first chunk that answers it. Line ranges and binary files pass through unchanged.",
+  "version": "1.0.2",
+  "description": "A Pi Agent extension that enhances `read` functionality for large text files to reduce context bloat, rot and lost in the middle issues.",
   "keywords": [
     "pi-package",
     "pi-extension"

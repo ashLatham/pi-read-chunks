@@ -1,12 +1,12 @@
 # pi-read-chunks
 
-A chunked, summarising `read` tool for large text files. Files under a size threshold are returned verbatim; larger files are split into overlapping chunks snapped to natural boundaries (function endings for code, paragraph breaks for prose), and each chunk is summarised by the active model, chaining the running summary forward as the file is consumed.
+A Pi Agent extension that enhances read functionality for large text files to reduce context bloat, rot and lost in the middle issues. Pi Agent's built in 'read()' tool truncates results over a certain size. 'read-chunks()' instead splits larger files into overlapping chunks snapped to natural boundaries (function endings for code, paragraph breaks for prose), and each chunk is summarised by the active model, chaining the running summary forward as the file is consumed. Files under a configurable size threshold have contents returned verbatim.
 
-Replaces the built-in `read()` for text files. Images and other binaries still pass through to the built-in `read`. A precise query stops the scan early at the first chunk that answers it; a line-range suffix (`file.txt:2000-2089` or `file.txt:N`) returns those lines verbatim with no summarisation.
+Replaces the built-in `read()` for text files. Images and other binaries still pass through to the built-in `read`. A precise query stops the scan early at the first chunk that answers it.
 
 ## Features
 
-**Built-in `read()` routing** — A `tool_call` listener intercepts the model's `read` calls. Image files (`png`, `jpg`, `gif`, `webp`, `svg`, `tiff`, `ico`, `heic`, `heif`) and other binaries (`pdf`, archives, Office docs, executables, media) pass through to `read()` unchanged. Text files and unknown extensions are blocked and the model is rerouted to `read-chunks` with the reason surfaced as the block message.
+**Built-in `read()` routing** — A `tool_call` listener intercepts the model's `read` calls. Image files (`png`, `jpg`, `gif`, `webp`, `svg`, `tiff`, `ico`, `heic`, `heif`) and other binaries (`pdf`, archives, Office docs, executables, media) pass through to `read()` unchanged. Text files and unknown extensions are blocked and the model is rerouted to `read-chunks` with the reason surfaced as the block message — **except** when the path carries a trailing numeric line-range suffix (`:N` or `:START-END`): those bypass the block entirely and reach the built-in `read()` verbatim, since native read already serves them with no summarisation needed.
 
 **Three read modes, one tool** — `read-chunks` selects automatically based on args:
 - *Full* — file is at or below `thresholdKB`. Returned verbatim. Matches built-in `read` semantics.
@@ -90,6 +90,7 @@ Examples:
 - `read-chunks({ path: "src/big.ts:2000-2089" })` — exact line range, no summarisation.
 - `read-chunks({ path: "src/big.ts:300" })` — start at line 300, read to EOF.
 - `read-chunks({ path: "diagram.png" })` — blocked at `read()` level; the model is rerouted to use the built-in `read` for images.
+- `read("src/file.ts:388-437")` — passes through the extension unblocked; native `read` returns those lines verbatim (line-range suffixes are never routed to `read-chunks`).
 
 ### Slash command
 
