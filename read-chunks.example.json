@@ -1,0 +1,5 @@
+{
+	"thresholdKB": 40,
+	"chunkChars": 24000,
+	"chunkOverlapChars": 800
+}
