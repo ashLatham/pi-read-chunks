@@ -1,6 +1,6 @@
 # pi-read-chunks
 
-A Pi Agent extension that enhances read functionality for large text files to reduce context bloat, rot and lost in the middle issues. Pi Agent's built in 'read()' tool truncates results over a certain size. 'read-chunks()' instead splits larger files into overlapping chunks snapped to natural boundaries (function endings for code, paragraph breaks for prose), and each chunk is summarised by the active model, chaining the running summary forward as the file is consumed. Files under a configurable size threshold have contents returned verbatim.
+A Pi Agent extension that enhances read functionality for large text files to reduce context bloat, rot and lost in the middle issues. Pi Agent's built in 'read()' tool truncates results over a certain size. 'read-chunks()' instead uses a sub-agent that splits larger files into overlapping chunks snapped to natural boundaries (function endings for code, paragraph breaks for prose), and each chunk is summarised by the active model, chaining the running summary forward as the file is consumed. Files under a configurable size threshold have contents returned verbatim. This keeps the full file content out of the main/orchestrator context.
 
 Replaces the built-in `read()` for text files. Images and other binaries still pass through to the built-in `read`. A precise query stops the scan early at the first chunk that answers it.
 
