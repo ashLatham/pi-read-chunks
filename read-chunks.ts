@@ -268,9 +268,14 @@ function buildSummarisePrompt(
 			hasPriorSummary
 				? "Include any relevant context from the prior summary below, but the summary should be focused on the new chunk. Do NOT repeat or echo the prior summary. Write a fresh summary of the CURRENT chunk."
 				: `Write a fresh summary of the CURRENT chunk. Be concise and factual. ${FACT_GUARD}`,
-			'If this chunk contains information that answers the query, begin your reply with exactly "| ANSWER:" ' +
+			'If this chunk contains information that FULLY answers the query, begin your reply with exactly "| ANSWER:" ' +
 				'followed by the precise answer passage, then a newline, then "---", then your NEW summary of this chunk.',
 			"Otherwise reply with ONLY your NEW summary of this chunk (no marker, no separator).",
+
+			"CRITICAL: Only emit the \"| ANSWER:\" marker if the chunk alone provides the COMPLETE answer to the query.",
+			"If the query requires information from multiple parts of the file (e.g., a synopsis, comparison, timeline),",
+			"do NOT mark individual chunks as answers. Continue reading until either the complete answer is found",
+			"or the file has been fully read.",
 			FACT_GUARD,
 		);
 		parts.push("", `Query: "${query}`);
