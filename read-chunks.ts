@@ -688,7 +688,7 @@ export default function (pi: ExtensionAPI) {
 
 		return {
 			block: true,
-			reason: "Built-in read() is disabled for text files. Use read-chunks(path/file, query) with a concise query describing what you are looking for.",
+			reason: "For text files: use read-chunks(path/file) or  read-chunks(path/file, query) with a concise query describing what you are looking for or read-chunks(path/file):linestart-lineend for a bounded file read.",
 		};
 	});
 
@@ -753,6 +753,15 @@ function formatReadChunksCall(args: any, theme: any, cwd: string): string {
 	if (m && m.index !== undefined) {
 		rangeSuffix = `:${m[2]}${m[3] !== undefined ? `-${m[3]}` : ""}`;
 		pathPart = m[1];
+	} else {
+		// No `:suffix` on path: derive the same `:START[-END]` form from explicit
+		// offset/limit args so the header reflects what was actually requested.
+		// Matches execute()'s semantics: offset alone = start at line N, read to EOF.
+		const off = typeof args?.offset === "number" ? args.offset : undefined;
+		const lim = typeof args?.limit === "number" ? args.limit : undefined;
+		if (off !== undefined) {
+			rangeSuffix = lim !== undefined ? `:${off}-${off + lim - 1}` : `:${off}`;
+		}
 	}
 
 	const pathDisplay = renderToolPath(pathPart || null, theme, cwd);
