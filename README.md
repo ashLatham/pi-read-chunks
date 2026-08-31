@@ -2,13 +2,13 @@
 
 A Pi Agent extension that enhances read functionality for large text files to reduce context bloat, rot and lost in the middle issues. Pi Agent's built in 'read()' tool truncates results over a certain size. 'read-chunks()' instead uses a sub-agent that splits larger files into overlapping chunks snapped to natural boundaries (function endings for code, paragraph breaks for prose), and each chunk is summarised by the active model, chaining the running summary forward as the file is consumed. Files under a configurable size threshold have contents returned verbatim. This keeps the full file content out of the main/orchestrator context.
 
-Replaces the built-in `read()` for text files. Images and other binaries still pass through to the built-in `read`. A precise query stops the scan early at the first chunk that answers it.
+Replaces the built-in `read()` for text files via `registerTool`. Images and other binaries are detected via MIME-type sniffing and delegated to the built-in `read`. A precise query stops the scan early at the first chunk that answers it.
 
 ## Features
 
-**Built-in `read()` routing** — A `tool_call` listener intercepts the model's `read` calls. Image files (`png`, `jpg`, `gif`, `webp`, `svg`, `tiff`, `ico`, `heic`, `heif`) and other binaries (`pdf`, archives, Office docs, executables, media) pass through to `read()` unchanged. Text files and unknown extensions are blocked and the model is rerouted to `read-chunks` with the reason surfaced as the block message — **except** when the path carries a trailing numeric line-range suffix (`:N` or `:START-END`): those bypass the block entirely and reach the built-in `read()` verbatim, since native read already serves them with no summarisation needed.
+**MIME-sniffing routing** — The extension replaces the built-in `read` tool via `registerTool`. On each invocation, the first 16 bytes of the file are sniffed for known magic-number signatures (PNG: `89 50 4E 47`, JPEG: `FF D8 FF`, GIF: `GIF87a/GIF89a`, WebP: `RIFF....WEBP`, BMP: `BM`, TIFF: `II*`/`MM*`, ICO: `00 00 01 00`, SVG: `<svg`, PDF: `%PDF-`, ZIP-based formats: `PK`, MP4/MOV: `ftyp`, FLAC: `fLaC`, Ogg: `OggS`, WAV: `RIFF....WAVE`, TAR: `ustar`, GZIP: `1F 8B`, BZ2: `BZ`, XZ: `FD 37 7A 58 5A 00`, 7z: `37 7A BC AF 27 1C`, EXE/DLL: `MZ`, ELF: `7F E4 4C`, ISO: `CD001`). Recognised MIME types delegate to the native `read` tool for image rendering or byte delivery. Text files and unknown extensions proceed to our own logic.
 
-**Three read modes, one tool** — `read-chunks` selects automatically based on args:
+**Three read modes, one tool** — `read-chunks` selects automatically based on file type and args:
 - *Full* — file is at or below `thresholdKB`. Returned verbatim. Matches built-in `read` semantics.
 - *Chunked scan* — file exceeds the threshold. Split into overlapping chunks at natural boundaries, each summarised by the active LLM with the running summary carried forward. With a `query`, scan stops at the first chunk whose summary contains the answer; without a query, the full file is summarised chunk-by-chunk and the running summary is returned.
 - *Line range* — `offset`/`limit` args, or the `path:N` / `path:START-END` suffix. Returns those lines verbatim and bypasses all summarisation.
@@ -22,6 +22,8 @@ Replaces the built-in `read()` for text files. Images and other binaries still p
 **Per-tool-result compression** — The raw chunked-mode payload is JSON; a `tool_result` hook rewrites it into a compact, line-budgeted summary (~25 chunk entries × 120 chars each) before the model sees it, so a multi-chunk scan doesn't blow the context budget. Toggle with `/read-chunks`.
 
 **Optional per-invocation debug dump** — `/read-chunks debug` (toggles on/off) writes each invocation's LLM requests/responses and the final tool return to `/tmp/read-chunks_<YYMMDD-hhmmss>.json`. Disabled by default.
+
+**Summary budget** — `thresholdKB` also acts as a soft cap on total summary size. Each chunk's LLM prompt includes a budget hint: `thresholdKB / numChunks` KB per chunk. For a 160KB file with 50KB threshold (4 chunks), each chunk gets ~12KB of summary budget. A 500KB file (10 chunks) → 5KB per chunk. This keeps the total summary proportional to `thresholdKB` regardless of file size, preventing small files from wasting context while still allowing large files enough room for useful summaries.
 
 
 ## Installation
@@ -58,17 +60,15 @@ Copy read-chunks.example.json to:
 
 ```json
 {
-  "thresholdKB": 10,
-  "chunkChars": 10000,
+  "thresholdKB": 50,
   "chunkOverlapChars": 800
 }
 ```
 
-| Key                | Default | Notes                                                                                          |
-| ------------------ | ------- | ---------------------------------------------------------------------------------------------- |
-| `thresholdKB`      | `10`    | Files ≤ this size are returned verbatim; larger files are chunked.                             |
-| `chunkChars`       | `10000` | Target chunk size in characters. Size to the active model's context window with prompt overhead in mind — there is no internal cap on what is sent to the summariser. |
-| `chunkOverlapChars`| `800`   | Backward overlap between consecutive chunks, in characters.                                    |
+| Key                 | Default | Notes                                                                                          |
+| ------------------- | ------- | ---------------------------------------------------------------------------------------------- |
+| `thresholdKB`       | `50`    | Files ≤ this size are returned verbatim; larger files are chunked using this same value as the target chunk size (KB). Also serves as the soft limit for total summary size — the per-chunk summary budget is `thresholdKB / numChunks`, so the total stays bounded to roughly one chunk's worth. |
+| `chunkOverlapChars` | `800`   | Backward overlap between consecutive chunks, in characters.                                    |
 
 
 ## Usage
@@ -89,8 +89,8 @@ Examples:
 - `read-chunks({ path: "src/big.ts" })` — full file summarised chunk-by-chunk; running summary returned.
 - `read-chunks({ path: "src/big.ts:2000-2089" })` — exact line range, no summarisation.
 - `read-chunks({ path: "src/big.ts:300" })` — start at line 300, read to EOF.
-- `read-chunks({ path: "diagram.png" })` — blocked at `read()` level; the model is rerouted to use the built-in `read` for images.
-- `read("src/file.ts:388-437")` — passes through the extension unblocked; native `read` returns those lines verbatim (line-range suffixes are never routed to `read-chunks`).
+- `read-chunks({ path: "diagram.png" })` — MIME sniffing detects the image type; delegating to the built-in `read` for native image rendering.
+- `read("src/file.ts:388-437")` — line-range suffix parsed and translated to `offset`/`limit`; native `read` returns those lines verbatim (no summarisation needed).
 
 ### Slash command
 
@@ -106,7 +106,7 @@ Examples:
 
 - No relevance ranking. Every chunk receives exactly one LLM summary; chunks aren't scored or re-ordered.
 - No persistence. Summaries aren't cached between invocations; each call re-summarises from scratch.
-- No support for binary files. Image/binary pass-through to `read()` is the only mechanism for non-text inspection.
+- No support for binary files. Image/binary detection via MIME sniffing — recognised types delegate to the built-in `read` for native rendering or byte delivery.
 
 ## Links
 

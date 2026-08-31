@@ -1,48 +1,146 @@
 /**
  * read-chunks — chunked read tool for large TEXT files.
  *
- * TEXT-ONLY. Binary files (PDF, archives, executables, images already handled
- * by read, etc.) are NOT supported by this tool — pass them through to read()
- * or another specialised tool. Boundary snapping, chunking, and LLM summarisation
- * all assume UTF-8 text.
+ * Replaces the built-in `read` tool. Files under the configured threshold
+ * are passed through to native read. Larger text files are split into
+ * overlapping chunks snapped to natural boundaries and summarised by the
+ * active model.
  *
- * Overrides the built-in `read` tool for text files. Files under the configured
- * size threshold are read in full. Larger files are split into overlapping chunks
- * snapped to natural boundaries (function endings for code, paragraph breaks
- * for prose), and every chunk is summarised by the active model, chaining the
- * running summary forward as chunks are consumed.
+ * Routing:
+ *   1. Image/binary (by MIME sniffing) → delegate to native read
+ *   2. Line-range suffix (:N or :START-END) or explicit offset/limit →
+ *      delegate to native read (strips suffix, translates to offset/limit)
+ *   3. File ≤ thresholdKB → delegate to native read
+ *   4. File > thresholdKB → chunked summarisation
  *
- * Modes:
- *   - No query: walk every chunk, accumulate one running summary, return it.
- *   - With query: walk chunks until one contains the answer; return the answer
- *     and per-chunk summaries. Stops early when found.
- *
- * There is no relevance ranking. Every chunk receives exactly one LLM summary.
- *
- * Chunk size is bounded by the `chunkChars` config value only — there is no
- * internal character cap on what is sent to the summariser. Size the chunk to
- * the active model's context window with prompt overhead in mind.
- *
- * A tool_call listener routes the model away from the built-in read() for
- * text/unknown files and toward read-chunks with a query. Image and binary
- * files are passed through to read() unchanged.
- * Chunk labels are line ranges (start-end), with char offsets in parentheses for
- * diagnostics; this tool's `offset` and `limit` arguments remain line-based like
- * the built-in read tool.
- *
- * Config is read from <cwd>/.pi/read-chunks.json merged over hard-coded defaults.
- * Unknown or invalid config values are ignored. Missing or malformed config
- * silently uses defaults. Config is loaded for each tool invocation, so changes
- * apply without restarting the extension.
+ * Config is read from <cwd>/.pi/read-chunks.json merged over hard-coded
+ * defaults. Unknown or invalid config values are ignored.
  */
 
-import { existsSync, readFileSync, statSync, writeFileSync, appendFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, appendFileSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
 import * as os from "node:os";
 import { pathToFileURL } from "node:url";
 import { Text, hyperlink, getCapabilities } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createReadTool } from "@earendil-works/pi-coding-agent";
+
+// ---------- MIME type sniffing ----------
+
+/**
+ * Read the first 16 bytes and check for known magic-number signatures.
+ * Returns the MIME type if recognised, null otherwise.
+ */
+function sniffMimeType(buf: Buffer): string | null {
+	// PNG: 89 50 4E 47 0D 0A 1A 0A
+	if (buf.length >= 8 &&
+		buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47 &&
+		buf[4] === 0x0D && buf[5] === 0x0A && buf[6] === 0x1A && buf[7] === 0x0A) {
+		return "image/png";
+	}
+	// JPEG: FF D8 FF
+	if (buf.length >= 3 && buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) {
+		return "image/jpeg";
+	}
+	// GIF87a / GIF89a
+	if (buf.length >= 6 &&
+		buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38 &&
+		(buf[5] === 0x61 || buf[5] === 0x39)) {
+		return "image/gif";
+	}
+	// WebP: RIFF....WEBP (bytes 0-3: RIFF, bytes 8-11: WEBP)
+	if (buf.length >= 12 &&
+		buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+		buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) {
+		return "image/webp";
+	}
+	// BMP: BM
+	if (buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x4D) {
+		return "image/bmp";
+	}
+	// TIFF (little-endian): II*
+	if (buf.length >= 4 && buf[0] === 0x49 && buf[1] === 0x49 && buf[2] === 0x2A && buf[3] === 0x00) {
+		return "image/tiff";
+	}
+	// TIFF (big-endian): MM*
+	if (buf.length >= 4 && buf[0] === 0x4D && buf[1] === 0x4D && buf[2] === 0x00 && buf[3] === 0x2A) {
+		return "image/tiff";
+	}
+	// ICO: 00 00 01 00
+	if (buf.length >= 4 && buf[0] === 0x00 && buf[1] === 0x00 && buf[2] === 0x01 && buf[3] === 0x00) {
+		return "image/x-icon";
+	}
+	// SVG (XML with svg element — check for <svg within first 16 bytes)
+	if (buf.length >= 16) {
+		const text = buf.toString("ascii", 0, 16).toLowerCase();
+		if (text.includes("<svg")) {
+			return "image/svg+xml";
+		}
+	}
+	// PDF: %PDF-
+	if (buf.length >= 5 && buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46 && buf[4] === 0x2D) {
+		return "application/pdf";
+	}
+	// ZIP-based: PK (DOCX, XLSX, PPTX, ODT, etc.)
+	if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4B && buf[2] === 0x03 && buf[3] === 0x04) {
+		return "application/zip";
+	}
+	// MP4/MOV: ftyp box (bytes 4-7: "ftyp")
+	if (buf.length >= 8 && buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) {
+		return "video/mp4";
+	}
+	// FLAC: fLaC
+	if (buf.length >= 4 && buf[0] === 0x66 && buf[1] === 0x4C && buf[2] === 0x61 && buf[3] === 0x43) {
+		return "audio/flac";
+	}
+	// Ogg: OggS
+	if (buf.length >= 4 && buf[0] === 0x4F && buf[1] === 0x67 && buf[2] === 0x67 && buf[3] === 0x53) {
+		return "audio/ogg";
+	}
+	// WAV: RIFF....WAVE
+	if (buf.length >= 12 &&
+		buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+		buf[8] === 0x57 && buf[9] === 0x41 && buf[10] === 0x56 && buf[11] === 0x45) {
+		return "audio/wav";
+	}
+	// TAR: offset 257-262 "ustar"
+	if (buf.length >= 263 && buf[257] === 0x75 && buf[258] === 0x73 && buf[259] === 0x74 && buf[260] === 0x61 && buf[261] === 0x72) {
+		return "application/x-tar";
+	}
+	// GZIP: 1F 8B
+	if (buf.length >= 2 && buf[0] === 0x1F && buf[1] === 0x8B) {
+		return "application/gzip";
+	}
+	// BZ2: 42 5A (BZ)
+	if (buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x5A) {
+		return "application/x-bzip2";
+	}
+	// XZ: FD 37 7A 58 5A 00
+	if (buf.length >= 6 &&
+		buf[0] === 0xFD && buf[1] === 0x37 && buf[2] === 0x7A && buf[3] === 0x58 && buf[4] === 0x5A && buf[5] === 0x00) {
+		return "application/x-xz";
+	}
+	// 7z: 37 7A BC AF 27 1C
+	if (buf.length >= 6 &&
+		buf[0] === 0x37 && buf[1] === 0x7A && buf[2] === 0xBC && buf[3] === 0xAF && buf[4] === 0x27 && buf[5] === 0x1C) {
+		return "application/x-7z-compressed";
+	}
+	// EXE/DLL: MZ
+	if (buf.length >= 2 && buf[0] === 0x4D && buf[1] === 0x5A) {
+		return "application/x-dosexec";
+	}
+	// ELF: 7F E4 4C 01 (Linux i386) or 7F E4 4C 02 (Linux x86-64)
+	if (buf.length >= 4 && buf[0] === 0x7F && buf[1] === 0xE4 && buf[2] === 0x4C && (buf[3] === 0x01 || buf[3] === 0x02)) {
+		return "application/x-executable";
+	}
+	// ISO: at offset 0x8001 "CD001"
+	if (buf.length >= 0x8006 &&
+		buf[0x8001] === 0x43 && buf[0x8002] === 0x44 && buf[0x8003] === 0x30 && buf[0x8004] === 0x30 && buf[0x8005] === 0x31) {
+		return "application/x-iso9660-image";
+	}
+	return null;
+}
 
 // ---------- Config ----------
 
@@ -54,11 +152,8 @@ function debugTimestamp(): string {
 }
 
 const DEFAULT_CONFIG = {
-	thresholdKB: 10,
-	chunkChars: 10_000,
+	thresholdKB: 50,
 	chunkOverlapChars: 800,
-
-
 	codeExtensions: [
 		".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
 		".py", ".rb", ".go", ".rs", ".java", ".kt", ".swift",
@@ -71,7 +166,6 @@ const DEFAULT_CONFIG = {
 
 type ReadSafeConfig = typeof DEFAULT_CONFIG;
 
-/** Load per-project settings. Deliberate degraded behavior: missing or malformed config preserves working defaults. */
 function loadConfig(cwd: string): ReadSafeConfig {
 	const cfgPath = join(cwd, ".pi", "read-chunks.json");
 	if (!existsSync(cfgPath)) return { ...DEFAULT_CONFIG };
@@ -81,44 +175,6 @@ function loadConfig(cwd: string): ReadSafeConfig {
 	} catch {
 		return { ...DEFAULT_CONFIG };
 	}
-}
-
-// ---------- Image / binary pass-through ----------
-
-/**
- * read-chunks is text-only. The built-in `read` tool handles images natively and
- * can also stream other binaries; this extension must not block those calls, or
- * the model loses its only way to inspect non-text files. The two lists below
- * are the pass-through set: any path whose extension matches either is left
- * alone and `read()` runs as if the extension were not installed.
- */
-
-/** Raster + vector image formats the read tool renders natively. */
-const IMAGE_EXTENSIONS = [
-	".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
-	".svg", ".tiff", ".tif", ".ico", ".heic", ".heif",
-];
-
-/** Non-text binary formats read() can deliver as bytes. Add to this list to allow. */
-const BINARY_EXTENSIONS = [
-	// Documents
-	".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp", ".rtf",
-	// Archives
-	".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".tgz", ".tbz2", ".txz",
-	// Executables / objects
-	".exe", ".dll", ".so", ".dylib", ".o", ".a", ".obj", ".lib", ".class", ".jar",
-	// Media (audio/video — read will likely refuse, but no harm in passing through)
-	".mp3", ".mp4", ".m4a", ".m4v", ".mov", ".avi", ".mkv", ".webm", ".ogg", ".wav", ".flac",
-	// Other binary blobs
-	".bin", ".dat", ".iso", ".img", ".dmg",
-];
-
-function isImagePath(path: string): boolean {
-	return IMAGE_EXTENSIONS.includes(extname(path).toLowerCase());
-}
-
-function isBinaryPath(path: string): boolean {
-	return BINARY_EXTENSIONS.includes(extname(path).toLowerCase());
 }
 
 // ---------- Language detection ----------
@@ -134,7 +190,6 @@ interface ChunkRange {
 	end: number;
 }
 
-/** Last natural boundary at or before `target`. Code → `}` line / blank; text → `\r?\n\r?\n` / `\r?\n`. */
 function snapBackward(text: string, target: number, codeMode: boolean): number {
 	if (target >= text.length) return text.length;
 	if (target <= 0) return 0;
@@ -174,7 +229,6 @@ function snapBackward(text: string, target: number, codeMode: boolean): number {
 	return boundary >= 0 ? boundary : target;
 }
 
-/** Next natural boundary at or after `target`. */
 function snapForward(text: string, target: number, codeMode: boolean): number {
 	if (target <= 0) return 0;
 	if (target >= text.length) return text.length;
@@ -203,22 +257,18 @@ function snapForward(text: string, target: number, codeMode: boolean): number {
 
 // ---------- Chunking ----------
 
-/**
- * Build ordered, non-empty chunks with a best-effort overlap.
- * If a natural boundary cannot provide safe forward progress, the next chunk
- * begins at the previous end rather than stalling or creating an empty range.
- */
 function buildChunks(
 	text: string,
-	chunkSize: number,
+	chunkKB: number,
 	overlap: number,
 	codeMode: boolean,
 ): ChunkRange[] {
+	const chunkChars = chunkKB * 1024;
 	const chunks: ChunkRange[] = [];
 	let cursor = 0;
 
 	while (cursor < text.length) {
-		const endTarget = Math.min(text.length, cursor + chunkSize);
+		const endTarget = Math.min(text.length, cursor + chunkChars);
 		let end = snapBackward(text, endTarget, codeMode);
 		if (end <= cursor) end = endTarget;
 		chunks.push({ start: cursor, end });
@@ -238,20 +288,13 @@ const UNSUMMARISED = "<summarisation unavailable>";
 const ANSWER_MARKER = "| ANSWER:";
 const FACT_GUARD = "Do not invent facts; base everything on the chunk.";
 
-/** Append prior-summary and chunk blocks to the prompt. Shared by query and summary modes. */
 function pushChunkBlock(parts: string[], range: ChunkRange, chunkText: string, priorSummary: string, hasPriorSummary: boolean): void {
 	if (hasPriorSummary) {
 		parts.push("", "Prior summary (for context):", '"""', priorSummary, '"""');
 	}
-	// Send the whole chunk; size is governed by config.chunkChars, not capped here.
 	parts.push("", `Current chunk (chars ${range.start}-${range.end}):`, '"""', chunkText, '"""', "", "Summary of current chunk:");
 }
 
-/**
- * Build the prompt for one summarisation call.
- * Two modes share most of their structure: query mode adds an ANSWER-marker
- * instruction and includes the query; summary mode omits both.
- */
 function buildSummarisePrompt(
 	chunkText: string,
 	priorSummary: string,
@@ -260,23 +303,22 @@ function buildSummarisePrompt(
 ): string {
 	const parts: string[] = [];
 	const hasPriorSummary = priorSummary.trim().length > 0;
+	const detailHint = "Preserve important information in the summary:\n - For Code: variables/functions, modules/packages, function calls, design patterns\n - For Prose: key factual information as bullet points";
 
 	if (query) {
 		parts.push(
 			`You are scanning a large file one chunk at a time, looking for information relevant to this query: "${query}".`,
 			"Read the NEXT chunk and produce a NEW summary of THIS CHUNK.",
 			hasPriorSummary
-				? "Include any relevant context from the prior summary below, but the summary should be focused on the new chunk. Do NOT repeat or echo the prior summary. Write a fresh summary of the CURRENT chunk."
-				: `Write a fresh summary of the CURRENT chunk. Be concise and factual. ${FACT_GUARD}`,
+				? `${detailHint}\nInclude any relevant context from the prior summary below, but the summary should be focused on the new chunk. Do NOT repeat or echo the prior summary. Write a fresh summary of the CURRENT chunk. ${FACT_GUARD}`
+				: `${detailHint}\nWrite a fresh summary of the CURRENT chunk. ${FACT_GUARD}`,
 			'If this chunk contains information that FULLY answers the query, begin your reply with exactly "| ANSWER:" ' +
 				'followed by the precise answer passage, then a newline, then "---", then your NEW summary of this chunk.',
 			"Otherwise reply with ONLY your NEW summary of this chunk (no marker, no separator).",
-
 			"CRITICAL: Only emit the \"| ANSWER:\" marker if the chunk alone provides the COMPLETE answer to the query.",
 			"If the query requires information from multiple parts of the file (e.g., a synopsis, comparison, timeline),",
 			"do NOT mark individual chunks as answers. Continue reading until either the complete answer is found",
 			"or the file has been fully read.",
-			FACT_GUARD,
 		);
 		parts.push("", `Query: "${query}`);
 	} else {
@@ -284,11 +326,10 @@ function buildSummarisePrompt(
 		if (hasPriorSummary) {
 			parts.push(
 				"The following is a running summary of the parts already seen. It is for CONTEXT ONLY.",
-				"Read the NEXT chunk and produce a NEW summary of THIS CHUNK. Include any relevant context from the prior summary, but the summary should be focused on the new chunk.",
-				"Do NOT repeat or echo the prior summary. Write a fresh summary of the CURRENT chunk.",
+				`${detailHint}\nInclude any relevant context from the prior summary, but the summary should be focused on the new chunk. Do NOT repeat or echo the prior summary. Write a fresh summary of the CURRENT chunk. ${FACT_GUARD}`,
 			);
 		} else {
-			parts.push(`Read the NEXT chunk and produce a NEW summary of THIS CHUNK. Be concise and factual. ${FACT_GUARD}`);
+			parts.push(`${detailHint}\nRead the NEXT chunk and produce a NEW summary of THIS CHUNK. ${FACT_GUARD}`);
 		}
 	}
 
@@ -296,15 +337,6 @@ function buildSummarisePrompt(
 	return parts.join("\n");
 }
 
-/**
- * Summarise one chunk against the running summary.
- *
- * Size contract: `chunkText` is sent verbatim, bounded only by config.chunkChars.
- * Returns null when the model can't be reached/authed (caller keeps prior summary).
- *
- * `priorSummary` accumulates across calls in the caller; in query mode the reply
- * is parsed by `parseAnswerResponse` for the ANSWER marker and separator.
- */
 async function summariseChunk(
 	chunkText: string,
 	priorSummary: string,
@@ -312,7 +344,7 @@ async function summariseChunk(
 	range: ChunkRange,
 	filePath: string,
 	modelRegistry: any,
-	model: any,  // Model<any> — passed directly to modelRegistry.complete
+	model: any,
 	debugPath: string | null,
 	debugEnabled: boolean,
 ): Promise<string | null> {
@@ -323,8 +355,6 @@ async function summariseChunk(
 		return null;
 	}
 
-	// File content and query are untrusted prompt text. Delimiters improve structure
-	// but do not neutralize instructions embedded in their contents.
 	const prompt = buildSummarisePrompt(chunkText, priorSummary, query, range);
 
 	const requestPayload = {
@@ -338,10 +368,7 @@ async function summariseChunk(
 
 	let response;
 	try {
-		response = await modelRegistry.complete(
-			model,
-			requestPayload,
-		);
+		response = await modelRegistry.complete(model, requestPayload);
 	} catch {
 		return null;
 	}
@@ -357,7 +384,6 @@ async function summariseChunk(
 	return summary || null;
 }
 
-/** Parse the query-mode contract out of an LLM reply. */
 function parseAnswerResponse(text: string): { answer?: string; summary: string } {
 	const idx = text.indexOf(ANSWER_MARKER);
 	if (idx < 0) return { summary: text.trim() };
@@ -375,6 +401,101 @@ function parseAnswerResponse(text: string): { answer?: string; summary: string }
 	return { answer, summary: rest };
 }
 
+// ---------- Line-range suffix parsing ----------
+
+/**
+ * Parse :N or :START-END suffix from path. Returns { newPath, offset, limit }
+ * or null if no suffix found.
+ */
+function parseLineRangeSuffix(path: string): { newPath: string; offset: number; limit?: number } | null {
+	const m = path.match(/^(.+):(\d+)(?:-(\d+))?$/);
+	if (!m) return null;
+	const newPath = m[1];
+	const startLine = Number(m[2]);
+	const endLine = m[3] !== undefined ? Number(m[3]) : undefined;
+	return {
+		newPath,
+		offset: startLine,
+		limit: endLine !== undefined ? Math.max(1, endLine - startLine + 1) : undefined,
+	};
+}
+
+// ---------- Call-header formatting ----------
+
+function shortenPath(p: string): string {
+	const home = os.homedir();
+	return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+}
+
+function renderToolPath(rawPath: string | null, theme: any, cwd: string): string {
+	if (rawPath === null) return theme.fg("error", "[invalid arg]");
+	const value = rawPath || "";
+	if (!value) return theme.fg("toolOutput", "...");
+	const styled = theme.fg("accent", shortenPath(value));
+	if (!getCapabilities().hyperlinks) return styled;
+	return hyperlink(styled, pathToFileURL(resolve(cwd, value)).href);
+}
+
+function formatReadChunksCall(args: any, theme: any, cwd: string): string {
+	const rawPath = typeof args?.path === "string" ? args.path : "";
+
+	let pathPart = rawPath;
+	let rangeSuffix = "";
+	const m = rawPath.match(/^(.*?):(\d+)(?:-(\d+))?$/);
+	if (m && m.index !== undefined) {
+		rangeSuffix = `:${m[2]}${m[3] !== undefined ? `-${m[3]}` : ""}`;
+		pathPart = m[1];
+	} else {
+		const off = typeof args?.offset === "number" ? args.offset : undefined;
+		const lim = typeof args?.limit === "number" ? args.limit : undefined;
+		if (off !== undefined) {
+			rangeSuffix = lim !== undefined ? `:${off}-${off + lim - 1}` : `:${off}`;
+		}
+	}
+
+	const pathDisplay = renderToolPath(pathPart || null, theme, cwd);
+	let text = `${theme.fg("toolTitle", theme.bold("read"))} ${pathDisplay}${theme.fg("warning", rangeSuffix)}`;
+
+	if (typeof args?.query === "string" && args.query.trim()) {
+		text += theme.fg("muted", ` [query: ${args.query.trim()}]`);
+	}
+	return text;
+}
+
+// ---------- Summary builder ----------
+
+function buildSummary(parsed: any): string {
+	const lines: string[] = [];
+	const kbTotal = parsed.kb_total ?? 0;
+	const scanned = parsed.chunks_scanned ?? 0;
+	const readCount = parsed.chunks_read ?? 0;
+	const mode = parsed.mode;
+	const stopReason = parsed.stop_reason ?? "completed";
+	const chunks = parsed.chunks ?? [];
+
+	lines.push(`[read-chunks] File ~${kbTotal}KB, ${scanned} chunks, ${readCount} summarised (${stopReason}).`);
+
+	if (mode === "query" && parsed.answer) {
+		lines.push("", `Answer: ${parsed.answer}`);
+	}
+
+	const CAP = 25;
+	for (let i = 0; i < chunks.length && i < CAP; i++) {
+		const s = chunks[i].summary ?? "";
+		lines.push(`${chunks[i].chunk}: ${s}`);
+	}
+	if (chunks.length > CAP) {
+		lines.push(`  ...and ${chunks.length - CAP} more chunk summaries.`);
+	}
+
+	lines.push(
+		"",
+		"Chunk labels are line ranges (start-end), with char offsets in parentheses. To inspect the original file, use read() with line-based offset/limit, or grep/find it.",
+	);
+
+	return lines.join("\n");
+}
+
 // ---------- Main tool ----------
 
 const ReadParams = Type.Object({
@@ -385,12 +506,14 @@ const ReadParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
-	// Session-only flags — defaults ON / OFF respectively. /read-chunks [debug]
 	let summaryCompressionEnabled = true;
 	let debugReturnEnabled = false;
 
-	 pi.registerCommand("read-chunks", {
-		description: "Toggle summary (default: on) when file size > configKB. 'debug' to toggle per-invocation /tmp/read-chunks_<YYMMDD-hhmmss>.json (default: off).",
+	// One native read instance for delegating images/binaries
+	const nativeRead = createReadTool(process.cwd());
+
+	pi.registerCommand("read-chunks", {
+		description: "Toggle summary compression (default: on). 'debug' to toggle per-invocation /tmp/read-chunks_<YYMMDD-hhmmss>.json (default: off).",
 		handler: async (args, ctx) => {
 			const tokens = (args ?? "").trim().toLowerCase().split(/\s+/);
 			const wantDebug = tokens.includes("debug");
@@ -411,8 +534,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "read-chunks",
-		label: "read-chunks (chunked scan)",
+		name: "read",
+		label: "read (chunked)",
 		description:
 			"TEXT-ONLY. Use instead of the built-in read() for text files.",
 		parameters: ReadParams,
@@ -420,28 +543,21 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 			let { path: rawPath, offset, limit } = params;
 
-			// Accept the `file.txt:X-Y` line-range shorthand (inclusive 1-indexed
-			// line span) and `file.txt:N` (start at line N, read to EOF) alongside
-			// explicit offset/limit. Strip the suffix and convert it to
-			// offset/start-line + limit/count.
-			if (typeof rawPath === "string") {
-				const m = rawPath.match(/:(\d+)(?:-(\d+))?$/);
-				if (m && !offset && !limit) {
-					const startLine = Number(m[1]);
-					const endLine = m[2] !== undefined ? Number(m[2]) : undefined;
-					rawPath = rawPath.slice(0, m.index);
-					offset = startLine;
-					if (endLine !== undefined) {
-						limit = Math.max(1, endLine - startLine + 1);
-					}
-				}
+			// Step 1: Parse line-range suffix (:N or :START-END)
+			const suffixResult = parseLineRangeSuffix(rawPath);
+			if (suffixResult) {
+				rawPath = suffixResult.newPath;
+				offset = suffixResult.offset;
+				limit = suffixResult.limit;
 			}
+
 			const absolutePath = resolve(ctx.cwd, rawPath);
 			const config = loadConfig(ctx.cwd);
 
-			// Per-invocation timestamp so each run appends to its own file.
+			// Per-invocation timestamp for debug output
 			const debugReturnPath = debugReturnEnabled ? `/tmp/read-chunks_${debugTimestamp()}.json` : null;
 
+			// Stat the file
 			let stat;
 			try {
 				stat = statSync(absolutePath);
@@ -459,6 +575,24 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			// Step 2: Sniff MIME type — image/binary → delegate to native read
+			let mime: string | null = null;
+			try {
+				const buf = readFileSync(absolutePath, { encoding: "binary", flag: "r" });
+				// Convert binary buffer to Buffer for sniffing
+				const bufAsBuffer = Buffer.from(buf, "binary");
+				mime = sniffMimeType(bufAsBuffer);
+			} catch {
+				// Can't read — fall through to text handling
+			}
+
+			if (mime) {
+				// Delegate to native read for images/binaries
+				const cleanParams = { ...params, path: rawPath };
+				return nativeRead.execute(_toolCallId, cleanParams, _signal, onUpdate, ctx);
+			}
+
+			// Step 3: Read content
 			let content: string;
 			try {
 				content = readFileSync(absolutePath, "utf-8");
@@ -469,8 +603,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// Explicit offset/limit request → return those lines verbatim.
-			// Bypasses threshold/chunk/query logic; matches built-in read semantics.
+			// Step 4: Has explicit range (offset/limit or suffix) → return verbatim
 			if (offset !== undefined || limit !== undefined) {
 				const lines = content.split("\n");
 				const startLine = Math.max(0, (offset ?? 1) - 1);
@@ -487,10 +620,10 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			// Step 5: Small file → full read
 			const sizeKB = stat.size / 1024;
 			const codeMode = isCode(rawPath, config.codeExtensions);
 
-			// Small file → full read
 			if (sizeKB <= config.thresholdKB) {
 				return {
 					content: [{ type: "text", text: content }],
@@ -503,13 +636,11 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// Large file → chunked summarisation
-			const chunks = buildChunks(content, config.chunkChars, config.chunkOverlapChars, codeMode);
+			// Step 6: Large file → chunked summarisation
+			const chunks = buildChunks(content, config.thresholdKB, config.chunkOverlapChars, codeMode);
 			const totalKB = Math.round((stat.size / 1024) * 10) / 10;
 
-			// Map char offsets → 1-indexed line numbers so chunk labels match how the
-			// agent reasons (built-in read uses line#, not char#). Precomputed once,
-			// binary-searched per chunk (O(n log n)).
+			// Map char offsets → 1-indexed line numbers
 			const lineStarts = [0];
 			for (let i = 0; i < content.length; i++) {
 				if (content[i] === "\n") lineStarts.push(i + 1);
@@ -525,7 +656,6 @@ export default function (pi: ExtensionAPI) {
 			};
 			const lineSpan = (range: ChunkRange): string => {
 				const s = lineOfChar(range.start);
-				// End is an exclusive offset: last included char is range.end - 1.
 				const e = range.end >= content.length ? lineStarts.length : lineOfChar(range.end - 1);
 				return `${s}-${e}`;
 			};
@@ -534,15 +664,13 @@ export default function (pi: ExtensionAPI) {
 				? params.query.trim()
 				: undefined;
 
-			// Find a model: try ctx.model first (set during conversation), then fall back to any available model.
+			// Find a model
 			let activeModel = ctx.model;
 			if (!activeModel) {
 				try {
 					const available = await ctx.modelRegistry.getAvailable();
 					if (available.length > 0) activeModel = available[0];
-				} catch {
-					// no model available
-				}
+				} catch {}
 			}
 			if (!activeModel) {
 				return {
@@ -572,7 +700,6 @@ export default function (pi: ExtensionAPI) {
 				if (noteRaw) runningSummary = noteRaw;
 				let displayNote = noteRaw ?? UNSUMMARISED;
 
-				// In query mode, extract answer and use parsed summary for display.
 				if (query && noteRaw) {
 					const parsed = parseAnswerResponse(noteRaw);
 					if (parsed.answer !== undefined) {
@@ -603,7 +730,6 @@ export default function (pi: ExtensionAPI) {
 				chunks: perChunk,
 			};
 
-			// Write final tool return to debug file
 			if (debugReturnEnabled) {
 				try {
 					appendFileSync(debugReturnPath, JSON.stringify({ phase: "tool_return", result: toolReturn }, null, 2) + "\n");
@@ -621,83 +747,17 @@ export default function (pi: ExtensionAPI) {
 			};
 		},
 
-		// Mirror the built-in read() call header so the UI shows
-		// `read-chunks <path>:<line-start-line-end>` (+ optional `[query: ...]`)
-		// instead of just the bare tool name. Built-in tools render their header via
-		// a custom renderCall; custom tools fall back to the plain tool-name fallback,
-		// so we supply one here.
 		renderCall(args, theme, context) {
 			const text = context.lastComponent ?? new Text("", 0, 0);
 			text.setText(formatReadChunksCall(args, theme, context.cwd));
 			return text;
 		},
-
-		// Full-file results keep built-in read presentation behavior. Chunked results
-		// are emitted as JSON because the model needs structured diagnostic metadata.
-	});
-
-	// Calls to the built-in read() are routed as follows:
-	//   - Image files (png/jpg/gif/...) → pass through; read() returns image content.
-	//   - Other binary files (pdf/zip/docx/...) → pass through; read() delivers bytes.
-	//   - Targeted line-range reads (offset and/or limit set) → pass through;
-	//     native read() serves them. These are scoped, summarisation-free.
-	//   - Line-range suffixes (:N or :START-END) on `path` → strip suffix,
-	//     translate to native read()'s offset/limit by mutating event.input,
-	//     and let native read() execute. Native read() does not understand the
-	//     suffix form, so the rewrite is required.
-	//   - Text files (and unknown extensions) without a range → block, route
-	//     model to read-chunks.
-	// The returned reason is surfaced to the model for its continuation; omitting
-	// terminate keeps the turn alive so the model reroutes to read-chunks.
-	pi.on("tool_call", (event) => {
-		if (event.toolName !== "read") return;
-		const input = event.input as { path?: unknown; offset?: number; limit?: number } | undefined;
-		const path = typeof input?.path === "string" ? input.path : "";
-		if (path && (isImagePath(path) || isBinaryPath(path))) return;
-
-		// Targeted line-range read: native read() handles it cheaply and the model
-		// already uses this form (offset/limit) because the read tool's schema
-		// documents it. Bypass the block — these are scoped, summarisation-free
-		// reads, exactly the kind we want read() to serve directly.
-		const hasExplicitRange = typeof input?.offset === "number" || typeof input?.limit === "number";
-		if (hasExplicitRange) return;
-
-		// Numeric line-range suffix (:N or :START-END): strip it from `path` and
-		// translate to native read()'s offset/limit, mutating event.input in place.
-		// Per the extension API contract, in-place mutation patches the args that
-		// the tool will execute with — no re-validation occurs after.
-		//
-		// Requires at least one char before the `:digits` (`.+`, not `.*?`) so
-		// that bare `:50` is rejected (a path cannot be `:50`) and so the engine
-		// picks the *last* colon-separator when the path itself contains colons
-		// (e.g. Windows `C:\Users\x\file.txt:10` or any URL-like prefix).
-		const m = path.match(/^(.+):(\d+)(?:-(\d+))?$/);
-		if (m) {
-			const newPath = m[1];
-			const startLine = Number(m[2]);
-			const endLine = m[3] !== undefined ? Number(m[3]) : undefined;
-			input!.path = newPath;
-			input!.offset = startLine;
-			if (endLine !== undefined) {
-				input!.limit = Math.max(1, endLine - startLine + 1);
-			} else {
-				delete input!.limit;
-			}
-			return;
-		}
-
-		return {
-			block: true,
-			reason: "For text files: use read-chunks(path/file) or  read-chunks(path/file, query) with a concise query describing what you are looking for or read-chunks(path/file):linestart-lineend for a bounded file read.",
-		};
 	});
 
 	// Compress chunked-mode results so raw JSON does not bloat model context.
-	// This hook changes model-visible content after execution; it does not replace
-	// the original tool execution result. Skipped when /read-chunks toggles it off.
 	pi.on("tool_result", async (event, _ctx) => {
 		if (!summaryCompressionEnabled) return;
-		if (event.toolName !== "read-chunks") return;
+		if (event.toolName !== "read") return;
 		if (event.isError) return;
 		const details = event.details as { mode?: string } | undefined;
 		if (details?.mode !== "chunked") return;
@@ -719,95 +779,4 @@ export default function (pi: ExtensionAPI) {
 			details: event.details,
 		};
 	});
-}
-
-// ---------- Call-header formatting ----------
-
-/** Shorten a path by replacing the home dir prefix with ~ (matches pi's built-in read header). */
-function shortenPath(p: string): string {
-	const home = os.homedir();
-	return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
-}
-
-/** Render a path accent-colored and hyperlinked when the terminal supports it. Mirrors pi's renderToolPath(). */
-function renderToolPath(rawPath: string | null, theme: any, cwd: string): string {
-	if (rawPath === null) return theme.fg("error", "[invalid arg]");
-	const value = rawPath || "";
-	if (!value) return theme.fg("toolOutput", "...");
-	const styled = theme.fg("accent", shortenPath(value));
-	if (!getCapabilities().hyperlinks) return styled;
-	return hyperlink(styled, pathToFileURL(resolve(cwd, value)).href);
-}
-
-/**
- * Build the read-chunks call header: `read-chunks <path>:<range>` plus an optional
- * `[query: ...]` suffix. Derives the line-range from the same `:N` / `:START-END`
- * shorthand execute() parses, so the header matches what was actually requested.
- */
-function formatReadChunksCall(args: any, theme: any, cwd: string): string {
-	const rawPath = typeof args?.path === "string" ? args.path : "";
-
-	let pathPart = rawPath;
-	let rangeSuffix = "";
-	const m = rawPath.match(/^(.*?):(\d+)(?:-(\d+))?$/);
-	if (m && m.index !== undefined) {
-		rangeSuffix = `:${m[2]}${m[3] !== undefined ? `-${m[3]}` : ""}`;
-		pathPart = m[1];
-	} else {
-		// No `:suffix` on path: derive the same `:START[-END]` form from explicit
-		// offset/limit args so the header reflects what was actually requested.
-		// Matches execute()'s semantics: offset alone = start at line N, read to EOF.
-		const off = typeof args?.offset === "number" ? args.offset : undefined;
-		const lim = typeof args?.limit === "number" ? args.limit : undefined;
-		if (off !== undefined) {
-			rangeSuffix = lim !== undefined ? `:${off}-${off + lim - 1}` : `:${off}`;
-		}
-	}
-
-	const pathDisplay = renderToolPath(pathPart || null, theme, cwd);
-	let text = `${theme.fg("toolTitle", theme.bold("read-chunks"))} ${pathDisplay}${theme.fg("warning", rangeSuffix)}`;
-
-	if (typeof args?.query === "string" && args.query.trim()) {
-		text += theme.fg("muted", ` [query: ${args.query.trim()}]`);
-	}
-	return text;
-}
-
-// ---------- Summary builder ----------
-
-/** Compact the raw chunked payload for in-context consumption. */
-function buildSummary(parsed: any): string {
-	const lines: string[] = [];
-	const kbTotal = parsed.kb_total ?? 0;
-	const scanned = parsed.chunks_scanned ?? 0;
-	const readCount = parsed.chunks_read ?? 0;
-	const mode = parsed.mode;
-	const stopReason = parsed.stop_reason ?? "completed";
-	const chunks = parsed.chunks ?? [];
-
-	lines.push(`[read-chunks] File ~${kbTotal}KB, ${scanned} chunks, ${readCount} summarised (${stopReason}).`);
-
-	if (mode === "query" && parsed.answer) {
-		const ans = String(parsed.answer).length > 300
-			? String(parsed.answer).slice(0, 297) + "..."
-			: String(parsed.answer);
-		lines.push("", `Answer: ${ans}`);
-	}
-
-	const CAP = 25;
-	for (let i = 0; i < chunks.length && i < CAP; i++) {
-		const s = chunks[i].summary ?? "";
-		const trimmed = s.length > 120 ? s.slice(0, 117) + "..." : s;
-		lines.push(`${chunks[i].chunk}: ${trimmed}`);
-	}
-	if (chunks.length > CAP) {
-		lines.push(`  ...and ${chunks.length - CAP} more chunk summaries.`);
-	}
-
-	lines.push(
-		"",
-		"Chunk labels are line ranges (start-end), with char offsets in parentheses. To inspect the original file, use read() with line-based offset/limit, or grep/find it.",
-	);
-
-	return lines.join("\n");
 }
