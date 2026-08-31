@@ -462,6 +462,45 @@ function formatReadChunksCall(args: any, theme: any, cwd: string): string {
 	return text;
 }
 
+// ---------- Summary compression ----------
+
+async function compressSummary(
+	text: string,
+	modelRegistry: any,
+	model: any,
+): Promise<string> {
+	if (!model) return text;
+	try {
+		if (!modelRegistry.hasConfiguredAuth(model)) return text;
+	} catch {
+		return text;
+	}
+
+	const prompt = `You are compressing a detailed summary into a denser, more concise version. Keep ALL factual content — names, places, events, dates, numbers, key details. Remove filler words, redundant phrases, unnecessary articles, and verbose constructions. Write in a telegraphic, information-dense style. Do not omit or dilute any facts.
+
+Compressed summary:
+"""
+${text}
+"""
+
+Compressed:`;
+
+	const requestPayload = {
+		model: model.id,
+		messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
+	};
+
+	try {
+		const response = await modelRegistry.complete(model, requestPayload);
+		const contentBlocks = response?.content || [];
+		const textBlocks = contentBlocks.filter((c: any) => c.type === "text");
+		if (textBlocks.length === 0) return text;
+		return textBlocks.map((c: any) => c.text).join(" ").trim();
+	} catch {
+		return text;
+	}
+}
+
 // ---------- Summary builder ----------
 
 function buildSummary(parsed: any): string {
@@ -721,6 +760,7 @@ export default function (pi: ExtensionAPI) {
 				mode: query ? "query" : "summary",
 				file: absolutePath,
 				kb_total: totalKB,
+				thresholdKB: config.thresholdKB,
 				chunks_scanned: chunks.length,
 				chunks_read: perChunk.length,
 				stop_reason: stopReason,
@@ -774,8 +814,21 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		let summaryText = buildSummary(parsed);
+
+		// Post-compression if summary exceeds thresholdKB
+		const model = _ctx.model;
+		const maxKB = parsed.thresholdKB;
+		if (model && maxKB) {
+			const summaryBytes = Buffer.byteLength(summaryText, "utf-8");
+			const summaryKB = summaryBytes / 1024;
+			if (summaryKB > maxKB) {
+				summaryText = await compressSummary(summaryText, _ctx.modelRegistry, model);
+			}
+		}
+
 		return {
-			content: [{ type: "text", text: buildSummary(parsed) }],
+			content: [{ type: "text", text: summaryText }],
 			details: event.details,
 		};
 	});

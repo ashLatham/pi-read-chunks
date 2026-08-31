@@ -1,6 +1,6 @@
 {
   "name": "pi-read-chunks",
-  "version": "2.0.0",
+  "version": "2.0.2",
   "description": "A Pi Agent extension that uses a subagent to enhance `read` functionality for large text files to reduce context bloat, rot and lost in the middle issues.",
   "keywords": [
     "pi-package",

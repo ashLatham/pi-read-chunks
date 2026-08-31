@@ -19,11 +19,11 @@ Replaces the built-in `read()` for text files via `registerTool`. Images and oth
 
 **Context-aware chunk labels** — Chunk labels are line ranges (`start-end`) with char offsets in parentheses, derived by binary-searching the file's `\n` positions. Labels match how the agent reasons (line numbers, not raw char offsets).
 
-**Per-tool-result compression** — The raw chunked-mode payload is JSON; a `tool_result` hook rewrites it into a compact, line-budgeted summary (~25 chunk entries × 120 chars each) before the model sees it, so a multi-chunk scan doesn't blow the context budget. Toggle with `/read-chunks`.
+**Per-tool-result compression** — The raw chunked-mode payload is JSON; a `tool_result` hook rewrites it into a human-readable summary before the model sees it, so a multi-chunk scan doesn't blow the context budget. Toggle with `/read-chunks`.
 
 **Optional per-invocation debug dump** — `/read-chunks debug` (toggles on/off) writes each invocation's LLM requests/responses and the final tool return to `/tmp/read-chunks_<YYMMDD-hhmmss>.json`. Disabled by default.
 
-**Summary budget** — `thresholdKB` also acts as a soft cap on total summary size. Each chunk's LLM prompt includes a budget hint: `thresholdKB / numChunks` KB per chunk. For a 160KB file with 50KB threshold (4 chunks), each chunk gets ~12KB of summary budget. A 500KB file (10 chunks) → 5KB per chunk. This keeps the total summary proportional to `thresholdKB` regardless of file size, preventing small files from wasting context while still allowing large files enough room for useful summaries.
+**Summary budget** — By default, summaries preserve names, places, events, dates, and key details without artificial truncation. Typical output stays under ~1.5KB for a 100KB file (~94% reduction from the original). If summaries exceed `thresholdKB`, they are sent back to the LLM for denser compression (up to 3 attempts) without losing factual content.
 
 
 ## Installation
@@ -67,7 +67,7 @@ Copy read-chunks.example.json to:
 
 | Key                 | Default | Notes                                                                                          |
 | ------------------- | ------- | ---------------------------------------------------------------------------------------------- |
-| `thresholdKB`       | `50`    | Files ≤ this size are returned verbatim; larger files are chunked using this same value as the target chunk size (KB). Also serves as the soft limit for total summary size — the per-chunk summary budget is `thresholdKB / numChunks`, so the total stays bounded to roughly one chunk's worth. |
+| `thresholdKB`       | `50`    | Files ≤ this size are returned verbatim; larger files are chunked using this same value as the target chunk size (KB). Also acts as the hard cap on total summary size — summaries exceeding this are sent back to the LLM for denser compression without losing factual content. |
 | `chunkOverlapChars` | `800`   | Backward overlap between consecutive chunks, in characters.                                    |
 
 
